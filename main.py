@@ -13,9 +13,11 @@ from psycopg2.extras import RealDictCursor
 from nicegui import ui
 
 BASE_DIR = Path(__file__).resolve().parent
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("NEON_DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("A variável DATABASE_URL não foi configurada no Render.")
+    raise RuntimeError(
+        "Configure DATABASE_URL ou NEON_DATABASE_URL nas variáveis de ambiente do Render."
+    )
 
 
 def get_connection():
