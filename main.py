@@ -4,62 +4,62 @@ import base64
 import csv
 import io
 import os
-
-import psycopg
-from psycopg.rows import dict_row
 from pathlib import Path
 from typing import Any
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 from nicegui import ui
 
 BASE_DIR = Path(__file__).resolve().parent
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://neondb_owner:npg_bB5JOtgiLF8K@ep-broad-recipe-b70qkc4b-pooler.c-13.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("A variável DATABASE_URL não foi configurada no Render.")
 
 
-def get_connection() -> psycopg.Connection:
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+def get_connection():
+    return psycopg2.connect(DATABASE_URL)
 
 
 def initialize_database() -> None:
     with get_connection() as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS processos (
-                id BIGSERIAL PRIMARY KEY,
-                pasta TEXT NOT NULL DEFAULT '',
-                nome TEXT NOT NULL DEFAULT '',
-                numero TEXT NOT NULL DEFAULT '',
-                assunto TEXT NOT NULL DEFAULT '',
-                link TEXT NOT NULL DEFAULT ''
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS processos (
+                    id BIGSERIAL PRIMARY KEY,
+                    pasta TEXT NOT NULL DEFAULT '',
+                    nome TEXT NOT NULL DEFAULT '',
+                    numero TEXT NOT NULL DEFAULT '',
+                    assunto TEXT NOT NULL DEFAULT '',
+                    link TEXT NOT NULL DEFAULT ''
+                )
+                """
             )
-            """
-        )
+            cursor.execute("SELECT COUNT(*) FROM processos")
+            total = cursor.fetchone()[0]
+            if total == 0:
+                import_embedded_data(connection)
         connection.commit()
 
-        total = connection.execute("SELECT COUNT(*) AS total FROM processos").fetchone()["total"]
-        if total == 0:
-            import_embedded_data(connection)
 
-
-def import_file(path: Path, connection: psycopg.Connection) -> int:
-    """Importa o TSV anexado, incluindo campos multilinha entre aspas."""
+def import_file(path: Path, connection) -> int:
+    """Importa um TSV, incluindo campos multilinha entre aspas."""
     inserted = 0
     with path.open("r", encoding="utf-8-sig", newline="") as file:
         reader = csv.reader(file, delimiter="\t", quotechar='"')
-        next(reader, None)  # cabeçalho
-        for row in reader:
-            if not row or not any(cell.strip() for cell in row):
-                continue
-            values = (row + [""] * 5)[:5]
-            # Linhas incompletas ou quebradas não impedem a importação do restante.
-            connection.execute(
-                "INSERT INTO processos (pasta, nome, numero, assunto, link) VALUES (%s, %s, %s, %s, %s)",
-                tuple(value.strip() for value in values),
-            )
-            inserted += 1
+        next(reader, None)
+        with connection.cursor() as cursor:
+            for row in reader:
+                if not row or not any(cell.strip() for cell in row):
+                    continue
+                values = (row + [""] * 5)[:5]
+                cursor.execute(
+                    "INSERT INTO processos (pasta, nome, numero, assunto, link) VALUES (%s, %s, %s, %s, %s)",
+                    tuple(value.strip() for value in values),
+                )
+                inserted += 1
     connection.commit()
     return inserted
 
@@ -70,20 +70,21 @@ EMBEDDED_TSV = base64.b64decode(
 ).decode("utf-8-sig")
 
 
-def import_embedded_data(connection: psycopg.Connection) -> int:
+def import_embedded_data(connection) -> int:
     """Importa a base completa incorporada no próprio main.py."""
     inserted = 0
     reader = csv.reader(io.StringIO(EMBEDDED_TSV), delimiter="\t", quotechar='"')
     next(reader, None)
-    for row in reader:
-        if not row or not any(cell.strip() for cell in row):
-            continue
-        values = (row + [""] * 5)[:5]
-        connection.execute(
-            "INSERT INTO processos (pasta, nome, numero, assunto, link) VALUES (%s, %s, %s, %s, %s)",
-            tuple(value.strip() for value in values),
-        )
-        inserted += 1
+    with connection.cursor() as cursor:
+        for row in reader:
+            if not row or not any(cell.strip() for cell in row):
+                continue
+            values = (row + [""] * 5)[:5]
+            cursor.execute(
+                "INSERT INTO processos (pasta, nome, numero, assunto, link) VALUES (%s, %s, %s, %s, %s)",
+                tuple(value.strip() for value in values),
+            )
+            inserted += 1
     connection.commit()
     return inserted
 
@@ -91,50 +92,53 @@ def import_embedded_data(connection: psycopg.Connection) -> int:
 def list_processes(search: str = "") -> list[dict[str, Any]]:
     search = search.strip()
     with get_connection() as connection:
-        if search:
-            pattern = f"%{search}%"
-            rows = connection.execute(
-                """
-                SELECT id, pasta, nome, numero, assunto, link
-                FROM processos
-                WHERE pasta ILIKE %s OR nome ILIKE %s OR numero ILIKE %s OR assunto ILIKE %s OR link ILIKE %s
-                ORDER BY id
-                """,
-                (pattern, pattern, pattern, pattern, pattern),
-            ).fetchall()
-        else:
-            rows = connection.execute(
-                """
-                SELECT id, pasta, nome, numero, assunto, link
-                FROM processos
-                ORDER BY id
-                """
-            ).fetchall()
-    return [dict(row) for row in rows]
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            if search:
+                pattern = f"%{search}%"
+                cursor.execute(
+                    """
+                    SELECT id, pasta, nome, numero, assunto, link
+                    FROM processos
+                    WHERE pasta ILIKE %s OR nome ILIKE %s OR numero ILIKE %s OR assunto ILIKE %s OR link ILIKE %s
+                    ORDER BY id
+                    """,
+                    (pattern, pattern, pattern, pattern, pattern),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, pasta, nome, numero, assunto, link
+                    FROM processos
+                    ORDER BY id
+                    """
+                )
+            return [dict(row) for row in cursor.fetchall()]
 
 
 def save_process(data: dict[str, str], process_id: int | None = None) -> None:
     with get_connection() as connection:
-        if process_id is None:
-            connection.execute(
-                "INSERT INTO processos (pasta, nome, numero, assunto, link) VALUES (%s, %s, %s, %s, %s)",
-                (data["pasta"], data["nome"], data["numero"], data["assunto"], data["link"]),
-            )
-        else:
-            connection.execute(
-                """
-                UPDATE processos
-                SET pasta = %s, nome = %s, numero = %s, assunto = %s, link = %s
-                WHERE id = %s
-                """,
-                (data["pasta"], data["nome"], data["numero"], data["assunto"], data["link"], process_id),
-            )
+        with connection.cursor() as cursor:
+            if process_id is None:
+                cursor.execute(
+                    "INSERT INTO processos (pasta, nome, numero, assunto, link) VALUES (%s, %s, %s, %s, %s)",
+                    (data["pasta"], data["nome"], data["numero"], data["assunto"], data["link"]),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE processos
+                    SET pasta = %s, nome = %s, numero = %s, assunto = %s, link = %s
+                    WHERE id = %s
+                    """,
+                    (data["pasta"], data["nome"], data["numero"], data["assunto"], data["link"], process_id),
+                )
         connection.commit()
 
 
 def delete_process(process_id: int) -> None:
     with get_connection() as connection:
-        connection.execute("DELETE FROM processos WHERE id = %s", (process_id,))
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM processos WHERE id = %s", (process_id,))
         connection.commit()
 
 
@@ -270,4 +274,4 @@ def main_page() -> None:
     dialog = ui.dialog()
 
 
-ui.run(title="Cadastro de Processos", host="0.0.0.0", port=8080, reload=False)
+ui.run(title="Cadastro de Processos", host="0.0.0.0", port=int(os.getenv("PORT", "8080")), reload=False)
